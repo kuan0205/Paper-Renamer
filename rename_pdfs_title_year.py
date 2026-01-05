@@ -178,6 +178,8 @@ def compute_preview(
     unmatched_dir: str,
     user_agent: str,
     progress_cb: Optional[Callable[[int, int, Path], None]] = None,
+    item_cb: Optional[Callable[[int, int, "PreviewItem"], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> List[PreviewItem]:
     cache: Dict[str, Tuple[Optional[str], Optional[int]]] = {}
     reserved_by_dir: Dict[Path, set] = {}
@@ -195,6 +197,8 @@ def compute_preview(
 
     total = len(pdfs)
     for idx, pdf in enumerate(pdfs, 1):
+        if cancel_event and cancel_event.is_set():
+            break
         if progress_cb:
             progress_cb(idx, total, pdf)
         old_name = pdf.name
@@ -226,33 +230,35 @@ def compute_preview(
             if unmatched_root:
                 reserved = get_reserved(unmatched_root)
                 dest = unique_path_with_reserved(unmatched_root / pdf.name, reserved)
-                items.append(
-                    PreviewItem(
-                        pdf=pdf,
-                        old_name=old_name,
-                        new_path=dest,
-                        doi=doi,
-                        title=None,
-                        year=year,
-                        status="move",
-                        reason="no title found",
-                        apply=True,
-                    )
+                item = PreviewItem(
+                    pdf=pdf,
+                    old_name=old_name,
+                    new_path=dest,
+                    doi=doi,
+                    title=None,
+                    year=year,
+                    status="move",
+                    reason="no title found",
+                    apply=True,
                 )
+                items.append(item)
+                if item_cb:
+                    item_cb(idx, total, item)
             else:
-                items.append(
-                    PreviewItem(
-                        pdf=pdf,
-                        old_name=old_name,
-                        new_path=None,
-                        doi=doi,
-                        title=None,
-                        year=year,
-                        status="skip",
-                        reason="no title found",
-                        apply=False,
-                    )
+                item = PreviewItem(
+                    pdf=pdf,
+                    old_name=old_name,
+                    new_path=None,
+                    doi=doi,
+                    title=None,
+                    year=year,
+                    status="skip",
+                    reason="no title found",
+                    apply=False,
                 )
+                items.append(item)
+                if item_cb:
+                    item_cb(idx, total, item)
             continue
 
         new_stem = build_new_stem(title, year, style)
@@ -261,33 +267,35 @@ def compute_preview(
         new_path = unique_path_with_reserved(pdf.with_name(new_name), reserved)
 
         if new_path.name == old_name:
-            items.append(
-                PreviewItem(
-                    pdf=pdf,
-                    old_name=old_name,
-                    new_path=new_path,
-                    doi=doi,
-                    title=title,
-                    year=year,
-                    status="ok",
-                    reason="already good name",
-                    apply=False,
-                )
+            item = PreviewItem(
+                pdf=pdf,
+                old_name=old_name,
+                new_path=new_path,
+                doi=doi,
+                title=title,
+                year=year,
+                status="ok",
+                reason="already good name",
+                apply=False,
             )
+            items.append(item)
+            if item_cb:
+                item_cb(idx, total, item)
         else:
-            items.append(
-                PreviewItem(
-                    pdf=pdf,
-                    old_name=old_name,
-                    new_path=new_path,
-                    doi=doi,
-                    title=title,
-                    year=year,
-                    status="rename",
-                    reason="ready",
-                    apply=True,
-                )
+            item = PreviewItem(
+                pdf=pdf,
+                old_name=old_name,
+                new_path=new_path,
+                doi=doi,
+                title=title,
+                year=year,
+                status="rename",
+                reason="ready",
+                apply=True,
             )
+            items.append(item)
+            if item_cb:
+                item_cb(idx, total, item)
 
     return items
 
@@ -297,11 +305,14 @@ def apply_changes(
     dry_run: bool,
     log=None,
     progress_cb: Optional[Callable[[int, int, PreviewItem], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Tuple[int, int]:
     renamed = 0
     skipped = 0
     total = len(items)
     for idx, item in enumerate(items, 1):
+        if cancel_event and cancel_event.is_set():
+            break
         if progress_cb:
             progress_cb(idx, total, item)
         if not item.apply or not item.new_path:
@@ -377,6 +388,7 @@ class RenamerGUI:
         self.user_agent = "PDF-Renamer/1.0 (mailto:unknown@example.com)"
         self._queue: "queue.Queue[tuple]" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
+        self._cancel_event = threading.Event()
 
         self.var_folder = tk.StringVar()
         self.var_recursive = tk.BooleanVar(value=False)
@@ -388,55 +400,81 @@ class RenamerGUI:
         self.var_status = tk.StringVar(value="就绪")
 
         self._build_ui()
+        self._set_busy(False)
 
     def _build_ui(self) -> None:
-        frm = ttk.Frame(self.root, padding=10)
+        self.root.minsize(880, 560)
+        self.root.resizable(True, True)
+        frm = ttk.Frame(self.root, padding=12)
         frm.grid(row=0, column=0, sticky="nsew")
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
+        frm.columnconfigure(0, weight=1)
+        frm.columnconfigure(1, weight=1)
+        frm.columnconfigure(2, weight=1)
 
         row = 0
-        ttk.Label(frm, text="文件夹").grid(row=row, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.var_folder, width=60).grid(row=row, column=1, sticky="ew")
-        ttk.Button(frm, text="浏览", command=self._browse).grid(row=row, column=2, padx=5)
-        frm.columnconfigure(1, weight=1)
+        path_frame = ttk.LabelFrame(frm, text="文件夹")
+        path_frame.grid(row=row, column=0, columnspan=3, sticky="ew", padx=2, pady=(0, 8))
+        path_frame.columnconfigure(1, weight=1)
+        ttk.Label(path_frame, text="路径").grid(row=0, column=0, sticky="w", padx=(8, 6), pady=6)
+        ttk.Entry(path_frame, textvariable=self.var_folder).grid(row=0, column=1, sticky="ew", pady=6)
+        ttk.Button(path_frame, text="浏览", command=self._browse).grid(row=0, column=2, padx=6, pady=6)
+        ttk.Checkbutton(path_frame, text="递归子文件夹", variable=self.var_recursive).grid(
+            row=1, column=0, sticky="w", padx=(8, 6), pady=(0, 6)
+        )
+        ttk.Checkbutton(path_frame, text="不使用Crossref(不联网)", variable=self.var_no_crossref).grid(
+            row=1, column=1, sticky="w", pady=(0, 6)
+        )
 
         row += 1
-        ttk.Checkbutton(frm, text="递归子文件夹", variable=self.var_recursive).grid(row=row, column=0, sticky="w")
-        ttk.Checkbutton(frm, text="不使用Crossref(不联网)", variable=self.var_no_crossref).grid(row=row, column=1, sticky="w")
+        options = ttk.LabelFrame(frm, text="参数")
+        options.grid(row=row, column=0, columnspan=3, sticky="ew", padx=2, pady=(0, 8))
+        for col in range(6):
+            options.columnconfigure(col, weight=0)
+        options.columnconfigure(5, weight=1)
+        ttk.Label(options, text="读取页数").grid(row=0, column=0, sticky="w", padx=(8, 6), pady=6)
+        ttk.Entry(options, textvariable=self.var_pages, width=8).grid(row=0, column=1, sticky="w", pady=6)
+        ttk.Label(options, text="文件名最大长度").grid(row=0, column=2, sticky="w", padx=(12, 6), pady=6)
+        ttk.Entry(options, textvariable=self.var_maxlen, width=8).grid(row=0, column=3, sticky="w", pady=6)
+        ttk.Label(options, text="未匹配移动到").grid(row=0, column=4, sticky="w", padx=(12, 6), pady=6)
+        ttk.Entry(options, textvariable=self.var_unmatched, width=18).grid(row=0, column=5, sticky="w", pady=6)
 
-        row += 1
-        ttk.Label(frm, text="读取页数").grid(row=row, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.var_pages, width=8).grid(row=row, column=1, sticky="w")
-        ttk.Label(frm, text="文件名最大长度").grid(row=row, column=1, sticky="e")
-        ttk.Entry(frm, textvariable=self.var_maxlen, width=8).grid(row=row, column=2, sticky="w")
-
-        row += 1
-        ttk.Label(frm, text="年份样式").grid(row=row, column=0, sticky="w")
-        ttk.Radiobutton(frm, text="前缀(年-标题)", variable=self.var_style, value="prefix").grid(row=row, column=1, sticky="w")
-        ttk.Radiobutton(frm, text="后缀(标题-年)", variable=self.var_style, value="suffix").grid(row=row, column=2, sticky="w")
-
-        row += 1
-        ttk.Label(frm, text="未匹配移动到").grid(row=row, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.var_unmatched, width=20).grid(row=row, column=1, sticky="w")
+        ttk.Label(options, text="年份样式").grid(row=1, column=0, sticky="w", padx=(8, 6), pady=(0, 6))
+        ttk.Radiobutton(options, text="前缀(年-标题)", variable=self.var_style, value="prefix").grid(
+            row=1, column=1, sticky="w", pady=(0, 6)
+        )
+        ttk.Radiobutton(options, text="后缀(标题-年)", variable=self.var_style, value="suffix").grid(
+            row=1, column=2, sticky="w", pady=(0, 6)
+        )
 
         row += 1
         btns = ttk.Frame(frm)
-        btns.grid(row=row, column=0, columnspan=3, sticky="w", pady=5)
-        self.btn_preview = ttk.Button(btns, text="预览", command=self._preview)
-        self.btn_preview.grid(row=0, column=0, padx=2)
+        btns.grid(row=row, column=0, columnspan=3, sticky="ew", padx=2, pady=(0, 8))
+        self.btn_list = ttk.Button(btns, text="列出PDF", command=self._list_pdfs)
+        self.btn_list.grid(row=0, column=0, padx=2, pady=(0, 4), sticky="w")
+        self.btn_preview = ttk.Button(btns, text="预览重命名", command=self._preview)
+        self.btn_preview.grid(row=0, column=1, padx=2, pady=(0, 4), sticky="w")
         self.btn_rename = ttk.Button(btns, text="重命名所选", command=self._rename_selected)
-        self.btn_rename.grid(row=0, column=1, padx=2)
+        self.btn_rename.grid(row=0, column=2, padx=2, pady=(0, 4), sticky="w")
         self.btn_all = ttk.Button(btns, text="全选", command=self._select_all)
-        self.btn_all.grid(row=0, column=2, padx=2)
+        self.btn_all.grid(row=1, column=0, padx=2, sticky="w")
         self.btn_none = ttk.Button(btns, text="全不选", command=self._select_none)
-        self.btn_none.grid(row=0, column=3, padx=2)
+        self.btn_none.grid(row=1, column=1, padx=2, sticky="w")
         self.btn_invert = ttk.Button(btns, text="反选", command=self._invert)
-        self.btn_invert.grid(row=0, column=4, padx=2)
+        self.btn_invert.grid(row=1, column=2, padx=2, sticky="w")
+        self.btn_cancel = ttk.Button(btns, text="取消", command=self._cancel)
+        self.btn_cancel.grid(row=1, column=3, padx=2, sticky="w")
 
         row += 1
+        tree_frame = ttk.LabelFrame(frm, text="预览列表")
+        tree_frame.grid(row=row, column=0, columnspan=3, sticky="nsew", padx=2, pady=(0, 8))
+        frm.rowconfigure(row, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+
         self.tree = ttk.Treeview(
-            frm,
+            tree_frame,
             columns=("apply", "old", "new", "status", "doi", "year"),
             show="headings",
             height=12,
@@ -449,26 +487,37 @@ class RenamerGUI:
             "doi": "DOI",
             "year": "年份",
         }
-        for col, w in [("apply", 60), ("old", 220), ("new", 260), ("status", 80), ("doi", 140), ("year", 60)]:
+        for col, w in [("apply", 60), ("old", 260), ("new", 320), ("status", 80), ("doi", 180), ("year", 60)]:
             self.tree.heading(col, text=headings.get(col, col))
-            self.tree.column(col, width=w, anchor="w")
-        self.tree.grid(row=row, column=0, columnspan=3, sticky="nsew")
-        frm.rowconfigure(row, weight=1)
+            stretch = col in ("old", "new", "doi")
+            self.tree.column(col, width=w, anchor="w", stretch=stretch, minwidth=80)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        x_scroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
         self.tree.bind("<Double-1>", self._toggle_apply)
         self.tree.bind("<space>", self._toggle_apply)
 
         row += 1
-        ttk.Label(frm, text="进度").grid(row=row, column=0, sticky="w")
-        self.progress = ttk.Progressbar(frm, mode="determinate", length=400)
-        self.progress.grid(row=row, column=1, columnspan=2, sticky="ew", padx=5)
+        status_frame = ttk.Frame(frm)
+        status_frame.grid(row=row, column=0, columnspan=3, sticky="ew", padx=2, pady=(0, 6))
+        status_frame.columnconfigure(1, weight=1)
+        ttk.Label(status_frame, text="进度").grid(row=0, column=0, sticky="w")
+        self.progress = ttk.Progressbar(status_frame, mode="determinate")
+        self.progress.grid(row=0, column=1, sticky="ew", padx=6)
 
         row += 1
-        ttk.Label(frm, textvariable=self.var_status).grid(row=row, column=0, columnspan=3, sticky="w")
+        ttk.Label(frm, textvariable=self.var_status).grid(row=row, column=0, columnspan=3, sticky="w", padx=4)
 
         row += 1
-        self.log_text = tk.Text(frm, height=8, wrap="word", state="disabled")
-        self.log_text.grid(row=row, column=0, columnspan=3, sticky="nsew")
-        frm.rowconfigure(row, weight=0)
+        log_frame = ttk.LabelFrame(frm, text="日志")
+        log_frame.grid(row=row, column=0, columnspan=3, sticky="nsew", padx=2, pady=(0, 2))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.log_text = tk.Text(log_frame, height=7, wrap="word", state="disabled")
+        self.log_text.grid(row=0, column=0, sticky="nsew")
 
     def _log(self, msg: str) -> None:
         self.log_text.configure(state="normal")
@@ -479,10 +528,12 @@ class RenamerGUI:
     def _set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
         self.btn_preview.configure(state=state)
+        self.btn_list.configure(state=state)
         self.btn_rename.configure(state=state)
         self.btn_all.configure(state=state)
         self.btn_none.configure(state=state)
         self.btn_invert.configure(state=state)
+        self.btn_cancel.configure(state="normal" if busy else "disabled")
 
     def _poll_queue(self) -> None:
         try:
@@ -504,6 +555,15 @@ class RenamerGUI:
                     self.var_status.set("预览完成")
                     self._set_busy(False)
                     self._worker = None
+                elif kind == "cancelled_preview":
+                    self.var_status.set("已取消预览")
+                    self._set_busy(False)
+                    self._worker = None
+                elif kind == "item":
+                    _, idx, item = msg
+                    if 0 <= idx < len(self.items):
+                        self.items[idx] = item
+                        self._refresh_row(idx)
                 elif kind == "done_rename":
                     _, renamed, skipped = msg
                     self._log(f"完成。重命名: {renamed}, 跳过: {skipped}")
@@ -511,6 +571,12 @@ class RenamerGUI:
                     self._set_busy(False)
                     self._worker = None
                     self.root.after(0, self._preview)
+                elif kind == "cancelled_rename":
+                    _, renamed, skipped = msg
+                    self._log(f"已取消。重命名: {renamed}, 跳过: {skipped}")
+                    self.var_status.set("已取消重命名")
+                    self._set_busy(False)
+                    self._worker = None
                 elif kind == "error":
                     _, err = msg
                     if messagebox:
@@ -534,6 +600,7 @@ class RenamerGUI:
     def _preview(self) -> None:
         if self._worker and self._worker.is_alive():
             return
+        self._cancel_event.clear()
         folder = self.var_folder.get().strip()
         if not folder:
             if messagebox:
@@ -554,10 +621,16 @@ class RenamerGUI:
             return
 
         pdfs = collect_pdfs(root, self.var_recursive.get())
+        if not pdfs:
+            if messagebox:
+                messagebox.showinfo("提示", "未检测到PDF。")
+            return
         self._log(f"找到 {len(pdfs)} 个 PDF。")
         self.progress.configure(maximum=max(1, len(pdfs)))
         self.progress["value"] = 0
         self.var_status.set("开始预览...")
+        self.items = self._pending_items(pdfs)
+        self._refresh_tree()
         self._set_busy(True)
 
         def worker():
@@ -574,8 +647,13 @@ class RenamerGUI:
                     unmatched_dir=self.var_unmatched.get().strip(),
                     user_agent=self.user_agent,
                     progress_cb=lambda i, t, p: self._queue.put(("progress", i, t, p.name)),
+                    item_cb=lambda i, t, it: self._queue.put(("item", i - 1, it)),
+                    cancel_event=self._cancel_event,
                 )
-                self._queue.put(("done_preview", items))
+                if self._cancel_event.is_set():
+                    self._queue.put(("cancelled_preview",))
+                else:
+                    self._queue.put(("done_preview", items))
             except Exception as e:
                 self._queue.put(("error", str(e)))
 
@@ -593,8 +671,45 @@ class RenamerGUI:
                 "",
                 "end",
                 iid=str(idx),
-                values=(apply_text, item.old_name, new_name, item.status, item.doi or "", item.year or ""),
+                values=(apply_text, item.old_name, new_name, self._status_label(item), item.doi or "", item.year or ""),
             )
+
+    def _pending_items(self, pdfs: List[Path]) -> List[PreviewItem]:
+        return [
+            PreviewItem(
+                pdf=pdf,
+                old_name=pdf.name,
+                new_path=None,
+                doi=None,
+                title=None,
+                year=None,
+                status="pending",
+                reason="pending",
+                apply=False,
+            )
+            for pdf in pdfs
+        ]
+
+    def _refresh_row(self, idx: int) -> None:
+        if str(idx) not in self.tree.get_children():
+            return
+        item = self.items[idx]
+        apply_text = "是" if item.apply else "否"
+        new_name = item.new_path.name if item.new_path else ""
+        self.tree.item(
+            str(idx),
+            values=(apply_text, item.old_name, new_name, self._status_label(item), item.doi or "", item.year or ""),
+        )
+
+    def _status_label(self, item: PreviewItem) -> str:
+        mapping = {
+            "pending": "待预览",
+            "rename": "重命名",
+            "move": "移动",
+            "ok": "无需",
+            "skip": "跳过",
+        }
+        return mapping.get(item.status, item.status)
 
     def _toggle_apply(self, event=None) -> None:
         sel = self.tree.selection()
@@ -603,19 +718,19 @@ class RenamerGUI:
         for iid in sel:
             idx = int(iid)
             item = self.items[idx]
-            if item.status in ("skip", "ok"):
+            if item.status in ("skip", "ok", "pending"):
                 continue
             item.apply = not item.apply
             apply_text = "是" if item.apply else "否"
             new_name = item.new_path.name if item.new_path else ""
             self.tree.item(
                 iid,
-                values=(apply_text, item.old_name, new_name, item.status, item.doi or "", item.year or ""),
+                values=(apply_text, item.old_name, new_name, self._status_label(item), item.doi or "", item.year or ""),
             )
 
     def _select_all(self) -> None:
         for idx, item in enumerate(self.items):
-            if item.status not in ("skip", "ok"):
+            if item.status not in ("skip", "ok", "pending"):
                 item.apply = True
         self._refresh_tree()
 
@@ -626,9 +741,39 @@ class RenamerGUI:
 
     def _invert(self) -> None:
         for item in self.items:
-            if item.status not in ("skip", "ok"):
+            if item.status not in ("skip", "ok", "pending"):
                 item.apply = not item.apply
         self._refresh_tree()
+
+    def _cancel(self) -> None:
+        if self._worker and self._worker.is_alive():
+            self._cancel_event.set()
+            self.var_status.set("正在取消...")
+            self._log("收到取消请求，正在停止当前任务...")
+
+    def _list_pdfs(self) -> None:
+        if self._worker and self._worker.is_alive():
+            return
+        folder = self.var_folder.get().strip()
+        if not folder:
+            if messagebox:
+                messagebox.showerror("错误", "请选择文件夹。")
+            return
+        root = Path(folder).expanduser().resolve()
+        if not root.exists() or not root.is_dir():
+            if messagebox:
+                messagebox.showerror("错误", "文件夹不存在。")
+            return
+        pdfs = collect_pdfs(root, self.var_recursive.get())
+        if not pdfs:
+            if messagebox:
+                messagebox.showinfo("提示", "未检测到PDF。")
+            return
+        self.items = self._pending_items(pdfs)
+        self._refresh_tree()
+        self.progress.configure(maximum=max(1, len(pdfs)))
+        self.progress["value"] = 0
+        self.var_status.set(f"已列出 {len(pdfs)} 个 PDF，点击“预览”开始解析")
 
     def _rename_selected(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -637,6 +782,7 @@ class RenamerGUI:
             if messagebox:
                 messagebox.showinfo("提示", "请先预览。")
             return
+        self._cancel_event.clear()
         to_apply = [i for i in self.items if i.apply and i.new_path]
         if not to_apply:
             if messagebox:
@@ -658,8 +804,12 @@ class RenamerGUI:
                     dry_run=False,
                     log=lambda m: self._queue.put(("log", m)),
                     progress_cb=lambda i, t, it: self._queue.put(("progress", i, t, it.pdf.name)),
+                    cancel_event=self._cancel_event,
                 )
-                self._queue.put(("done_rename", renamed, skipped))
+                if self._cancel_event.is_set():
+                    self._queue.put(("cancelled_rename", renamed, skipped))
+                else:
+                    self._queue.put(("done_rename", renamed, skipped))
             except Exception as e:
                 self._queue.put(("error", str(e)))
 
